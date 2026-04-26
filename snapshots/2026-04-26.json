@@ -1,0 +1,17 @@
+{
+  "query": "hot",
+  "sources": [
+    "dc"
+  ],
+  "count": 0,
+  "items": [],
+  "buckets": {},
+  "bucket_summaries": {},
+  "errors": [
+    {
+      "source": "dc",
+      "error": "python3: can't open file '/data/data/com.termux/files/home/scripts/dc_fetch.py': [Errno 2] No such file or directory"
+    }
+  ],
+  "fetched_at": "2026-04-26T04:28:11.557635+00:00"
+}

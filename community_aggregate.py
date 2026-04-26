@@ -12,10 +12,13 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-WORKSPACE = Path(__file__).resolve().parent.parent
-SCRIPTS = WORKSPACE / "scripts"
+REPO_DIR = Path(__file__).resolve().parent
+# Standalone repo: scripts are in same dir. OpenClaw workspace: scripts/ sibling
+_SCRIPTS_CANDIDATES = [REPO_DIR, REPO_DIR.parent / "scripts"]
+SCRIPTS = next((p for p in _SCRIPTS_CANDIDATES if (p / "dc_fetch.py").exists()), REPO_DIR)
 STATE_FILE = Path(__file__).resolve().parent / "state.json"
 WATCHLIST_FILE = Path(__file__).resolve().parent / "watchlist.json"
+SNAPSHOTS_DIR = Path(__file__).resolve().parent / "snapshots"
 DEFAULT_SOURCES = ["reddit", "dc", "github", "hn", "youtube", "searxng"]
 ALL_SOURCES = DEFAULT_SOURCES + ["searxng", "discord"]
 DESCRIPTION = "Aggregate community sentiment/signals across non-Discord sources by default, with optional Discord support."
@@ -58,7 +61,7 @@ class AggregateError(RuntimeError):
 
 
 def run_json(args: List[str], timeout: int = DEFAULT_TIMEOUT) -> Any:
-    proc = subprocess.run(args, cwd=WORKSPACE, capture_output=True, text=True, timeout=timeout)
+    proc = subprocess.run(args, cwd=SCRIPTS, capture_output=True, text=True, timeout=timeout)
     if proc.returncode != 0:
         raise AggregateError((proc.stderr or proc.stdout or f"command failed: {' '.join(args)}").strip())
     try:
@@ -943,7 +946,86 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--incremental", action="store_true", help="Only collect items newer than last run (uses state.json)")
     parser.add_argument("--watch", action="store_true", help="Filter results to watchlist matches only (uses watchlist.json)")
     parser.add_argument("--watch-alert", action="store_true", help="Output watchlist matches in alert format for Telegram delivery")
+    parser.add_argument("--snapshot", action="store_true", help="Save results to snapshots/YYYY-MM-DD.json")
+    parser.add_argument("--history", type=int, nargs="?", const=7, default=None, help="Show snapshot history (default 7 days)")
+    parser.add_argument("--compare", type=int, default=None, metavar="N", help="Compare current results with N-days-ago snapshot")
     return parser
+
+
+def save_snapshot(payload: Dict[str, Any], date_str: Optional[str] = None) -> Path:
+    SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+    if not date_str:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+    path = SNAPSHOTS_DIR / f"{date_str}.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def load_snapshot(date_str: str) -> Optional[Dict[str, Any]]:
+    path = SNAPSHOTS_DIR / f"{date_str}.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def list_snapshots() -> List[str]:
+    if not SNAPSHOTS_DIR.exists():
+        return []
+    return sorted(f.stem for f in SNAPSHOTS_DIR.glob("*.json"))
+
+
+def compare_snapshots(current: Dict[str, Any], past: Dict[str, Any]) -> Dict[str, Any]:
+    current_titles = {item.get("title", "") for item in (current.get("items") or [])}
+    past_titles = {item.get("title", "") for item in (past.get("items") or [])}
+    new_items = [i for i in (current.get("items") or []) if i.get("title") not in past_titles]
+    gone_items = [i for i in (past.get("items") or []) if i.get("title") not in current_titles]
+    common = current_titles & past_titles
+    return {
+        "current_date": current.get("fetched_at", ""),
+        "past_date": past.get("fetched_at", ""),
+        "new_count": len(new_items),
+        "gone_count": len(gone_items),
+        "common_count": len(common),
+        "new_items": new_items[:10],
+        "gone_items": gone_items[:10],
+    }
+
+
+def emit_history(days: int) -> str:
+    snaps = list_snapshots()
+    if not snaps:
+        return "No snapshots found. Run with --snapshot first."
+    recent = snaps[-days:] if days else snaps
+    lines = [f"📋 Snapshot History ({len(recent)} days)", ""]
+    for snap_date in recent:
+        data = load_snapshot(snap_date)
+        count = (data or {}).get("count", "?")
+        sources = ", ".join((data or {}).get("sources") or [])
+        lines.append(f"  {snap_date}: {count} items [{sources}]")
+    return "\n".join(lines)
+
+
+def emit_compare(cmp: Dict[str, Any]) -> str:
+    lines = ["📊 Snapshot Comparison"]
+    lines.append(f"  Then: {cmp['past_date']}")
+    lines.append(f"  Now:  {cmp['current_date']}")
+    lines.append(f"")
+    lines.append(f"  🆕 New: {cmp['new_count']} | ❌ Gone: {cmp['gone_count']} | 📌 Common: {cmp['common_count']}")
+    if cmp.get("new_items"):
+        lines.append(f"")
+        lines.append("  New items:")
+        for item in cmp["new_items"][:5]:
+            source = item.get("source", "")
+            emoji = SOURCE_EMOJI.get(source, "📌")
+            lines.append(f"    {emoji} {item.get('title', '')}")
+    if cmp.get("gone_items"):
+        lines.append(f"")
+        lines.append("  Gone items:")
+        for item in cmp["gone_items"][:5]:
+            source = item.get("source", "")
+            emoji = SOURCE_EMOJI.get(source, "📌")
+            lines.append(f"    {emoji} {item.get('title', '')}")
+    return "\n".join(lines)
 
 
 def main() -> int:
@@ -956,6 +1038,11 @@ def main() -> int:
         args.output_mode = "brief"
     elif args.full:
         args.output_mode = "full"
+
+    # Handle --history subcommand (no collection needed)
+    if args.history is not None:
+        print(emit_history(args.history))
+        return 0
 
     if args.preset:
         preset = PRESET_CONFIGS[args.preset]
@@ -980,6 +1067,22 @@ def main() -> int:
         if alert_text:
             print(alert_text)
             print()
+
+    # Handle --snapshot
+    if args.snapshot:
+        snap_path = save_snapshot(payload)
+        print(f"Snapshot saved: {snap_path}")
+
+    # Handle --compare
+    if args.compare is not None:
+        compare_date = (datetime.now() - timedelta(days=args.compare)).strftime("%Y-%m-%d")
+        past = load_snapshot(compare_date)
+        if not past:
+            print(f"No snapshot found for {compare_date}. Run with --snapshot first.", file=sys.stderr)
+            return 1
+        cmp = compare_snapshots(payload, past)
+        print(emit_compare(cmp))
+        return 0
 
     if args.format == "json":
         print(json.dumps(payload, ensure_ascii=False, indent=2))
