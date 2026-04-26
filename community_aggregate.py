@@ -20,6 +20,8 @@ DEFAULT_SOURCES = ["reddit", "dc", "github", "hn", "youtube", "searxng"]
 ALL_SOURCES = DEFAULT_SOURCES + ["searxng", "discord"]
 DESCRIPTION = "Aggregate community sentiment/signals across non-Discord sources by default, with optional Discord support."
 DEFAULT_TIMEOUT = 45
+TIME_DECAY_HALF_LIFE_HOURS = 6
+TIME_DECAY_FLOOR = 0.1
 GENERIC_HOT_QUERIES = {
     "hot", "trending", "trend", "news", "realtime", "real-time", "issues",
     "핫", "핫이슈", "실시간", "트렌드", "이슈", "전체", "종합",
@@ -232,6 +234,52 @@ def _log_score(value: int, factor: int = 100) -> int:
     return int(math.log10(value + 1) * factor)
 
 
+def _compute_percentiles(items: List[Dict[str, Any]]) -> None:
+    by_source: Dict[str, List[Dict[str, Any]]] = {}
+    for item in items:
+        by_source.setdefault(item.get("source") or "unknown", []).append(item)
+    for source, source_items in by_source.items():
+        raw_scores = []
+        for item in source_items:
+            extra = item.get("extra") or {}
+            sr = as_int(extra.get("source_rank")) or 0
+            s = item.get("score") or 0
+            c = item.get("comments") or 0
+            raw_scores.append(sr + s * 10 + c * 5)
+        if not raw_scores:
+            continue
+        sorted_scores = sorted(raw_scores)
+        n = len(sorted_scores)
+        for i, item in enumerate(source_items):
+            extra = item.get("extra") or {}
+            sr = as_int(extra.get("source_rank")) or 0
+            s = item.get("score") or 0
+            c = item.get("comments") or 0
+            raw = sr + s * 10 + c * 5
+            rank_pos = sorted_scores.index(raw)
+            percentile = (rank_pos / n) * 100 if n > 1 else 50
+            item.setdefault("extra", {})["percentile"] = round(percentile, 1)
+
+
+def _time_decay_factor(published: Optional[str]) -> float:
+    if not published:
+        return 1.0
+    try:
+        if published.endswith("Z"):
+            published = published[:-1] + "+00:00"
+        pub_dt = datetime.fromisoformat(published)
+        if pub_dt.tzinfo is None:
+            pub_dt = pub_dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        age_hours = (now - pub_dt).total_seconds() / 3600.0
+        if age_hours <= TIME_DECAY_HALF_LIFE_HOURS:
+            return 1.0
+        decay = 0.5 ** (age_hours / TIME_DECAY_HALF_LIFE_HOURS)
+        return max(decay, TIME_DECAY_FLOOR)
+    except (ValueError, TypeError):
+        return 1.0
+
+
 def _universal_rank(item: Dict[str, Any], query: Optional[str] = None) -> int:
     source = item.get("source") or ""
     kind = item.get("kind") or ""
@@ -254,6 +302,13 @@ def _universal_rank(item: Dict[str, Any], query: Optional[str] = None) -> int:
         rank = base + _log_score(comments, 90)
     else:
         rank = base + _log_score(score, 120) + _log_score(comments, 90)
+
+    percentile = extra.get("percentile")
+    if percentile is not None:
+        rank = int(rank * 0.6 + percentile * 8)
+
+    decay = _time_decay_factor(item.get("published"))
+    rank = int(rank * decay)
 
     q = (query or "").strip().lower()
     if q in GENERIC_HOT_QUERIES:
@@ -644,6 +699,8 @@ def aggregate(args: argparse.Namespace) -> Dict[str, Any]:
 
     for item in out:
         item.setdefault("extra", {})["bucket"] = _bucket_for_item(item)
+
+    _compute_percentiles(out)
 
     watch_matches: List[Dict[str, Any]] = []
     if watch or watch_alert:
