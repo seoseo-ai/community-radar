@@ -764,6 +764,90 @@ SOURCE_EMOJI = {
 }
 
 
+def emit_telegram(payload: Dict[str, Any]) -> str:
+    lines = []
+    items = payload.get("items") or []
+    if not items:
+        return "(no items)"
+    for item in items:
+        source = item.get("source") or ""
+        emoji = SOURCE_EMOJI.get(source, "\U0001f4cc")
+        title = item.get("title") or "(no title)"
+        url = item.get("url") or ""
+        score = item.get("score")
+        comments = item.get("comments")
+        meta_parts = []
+        if score is not None:
+            meta_parts.append(f"\u2b06{score}")
+        if comments is not None:
+            meta_parts.append(f"\U0001f4ac{comments}")
+        meta = " ".join(meta_parts)
+        line = f"{emoji} {title}"
+        if meta:
+            line += f" [{meta}]"
+        if url:
+            line += f"\n   {url}"
+        lines.append(line)
+    watch_alerts = payload.get("watch_alerts")
+    if watch_alerts:
+        lines.append("")
+        lines.append("\u26a0\ufe0f Watch Alerts:")
+        for item in watch_alerts:
+            wm = (item.get("extra") or {}).get("watch_matches") or []
+            lines.append(f"  {', '.join(wm)}: {item.get('title')}")
+    return "\n".join(lines)
+
+
+def emit_markdown(payload: Dict[str, Any]) -> str:
+    lines = []
+    q = payload.get("query") or ""
+    lines.append(f"# Community Radar: {q}")
+    lines.append(f"*{payload.get('count', 0)} items from {', '.join(payload.get('sources') or [])}*")
+    lines.append("")
+    buckets = payload.get("buckets") or {}
+    ordered_buckets = [b for b in ["news", "community", "dev", "other"] if buckets.get(b)]
+    if ordered_buckets:
+        for bucket in ordered_buckets:
+            bucket_items = buckets[bucket]
+            lines.append(f"## {bucket.title()} ({len(bucket_items)})")
+            lines.append("")
+            for item in bucket_items:
+                source = item.get("source") or ""
+                emoji = SOURCE_EMOJI.get(source, "\U0001f4cc")
+                title = item.get("title") or "(no title)"
+                url = item.get("url") or ""
+                score = item.get("score")
+                comments = item.get("comments")
+                meta_parts = []
+                if score is not None:
+                    meta_parts.append(f"\u2b06{score}")
+                if comments is not None:
+                    meta_parts.append(f"\U0001f4ac{comments}")
+                meta = " ".join(meta_parts)
+                if url:
+                    lines.append(f"- {emoji} [{title}]({url}) {meta}")
+                else:
+                    lines.append(f"- {emoji} {title} {meta}")
+            lines.append("")
+    else:
+        for item in (payload.get("items") or []):
+            source = item.get("source") or ""
+            emoji = SOURCE_EMOJI.get(source, "\U0001f4cc")
+            title = item.get("title") or "(no title)"
+            url = item.get("url") or ""
+            if url:
+                lines.append(f"- {emoji} [{title}]({url})")
+            else:
+                lines.append(f"- {emoji} {title}")
+        lines.append("")
+    if payload.get("errors"):
+        lines.append("---")
+        lines.append("**Warnings:**")
+        for err in payload["errors"]:
+            lines.append(f"- {err.get('source')}: {err.get('error')}")
+    return "\n".join(lines).rstrip()
+
+
 def emit_watch_alert(payload: Dict[str, Any]) -> str:
     alerts = payload.get("watch_alerts") or []
     if not alerts:
@@ -788,7 +872,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sources", nargs="+", choices=ALL_SOURCES, default=None)
     parser.add_argument("--limit", type=int, default=5, help="Per-source fetch limit")
     parser.add_argument("--max-items", type=int, default=20, help="Final merged item cap")
-    parser.add_argument("--format", choices=("json", "text"), default="text")
+    parser.add_argument("--format", choices=("json", "text", "markdown", "telegram"), default="text")
     parser.add_argument("--output-mode", choices=("brief", "default", "full"), default="default", help="Text output verbosity")
     parser.add_argument("--brief", action="store_true", help="Alias for --output-mode brief")
     parser.add_argument("--full", action="store_true", help="Alias for --output-mode full")
@@ -842,6 +926,10 @@ def main() -> int:
 
     if args.format == "json":
         print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif args.format == "markdown":
+        print(emit_markdown(payload))
+    elif args.format == "telegram":
+        print(emit_telegram(payload))
     else:
         print(emit_text(payload, output_mode=args.output_mode))
     return 0
