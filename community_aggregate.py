@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import subprocess
 import sys
@@ -13,6 +14,7 @@ from typing import Any, Dict, List, Optional
 
 WORKSPACE = Path(__file__).resolve().parent.parent
 SCRIPTS = WORKSPACE / "scripts"
+STATE_FILE = Path(__file__).resolve().parent / "state.json"
 DEFAULT_SOURCES = ["reddit", "dc", "github", "hn", "youtube", "searxng"]
 ALL_SOURCES = DEFAULT_SOURCES + ["searxng", "discord"]
 DESCRIPTION = "Aggregate community sentiment/signals across non-Discord sources by default, with optional Discord support."
@@ -88,6 +90,57 @@ def as_int(value: Any) -> Optional[int]:
             except ValueError:
                 return None
     return None
+
+
+def load_state() -> Dict[str, Any]:
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_state(state: Dict[str, Any]) -> None:
+    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def update_state_for_source(state: Dict[str, Any], source: str, items: List[Dict[str, Any]]) -> None:
+    if not items:
+        return
+    latest_published = ""
+    latest_id = ""
+    for item in items:
+        pub = item.get("published") or ""
+        if pub > latest_published:
+            latest_published = pub
+        item_url = item.get("url") or ""
+        if item_url > latest_id:
+            latest_id = item_url
+    state[source] = {
+        "last_seen_id": latest_id,
+        "last_seen_ts": latest_published,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def filter_incremental(items: List[Dict[str, Any]], source: str, state: Dict[str, Any]) -> List[Dict[str, Any]]:
+    source_state = state.get(source) or {}
+    last_ts = source_state.get("last_seen_ts") or ""
+    last_id = source_state.get("last_seen_id") or ""
+    if not last_ts and not last_id:
+        return items
+    filtered = []
+    for item in items:
+        pub = item.get("published") or ""
+        url = item.get("url") or ""
+        if last_ts and pub and pub > last_ts:
+            filtered.append(item)
+        elif last_id and url and url != last_id and pub and pub >= last_ts:
+            filtered.append(item)
+        elif not last_ts and url and url != last_id:
+            filtered.append(item)
+    return filtered
 
 
 def to_item(source: str, kind: str, title: str, url: str, *, author: Optional[str] = None, published: Optional[str] = None,
@@ -515,30 +568,40 @@ def aggregate(args: argparse.Namespace) -> Dict[str, Any]:
     sources = args.sources or DEFAULT_SOURCES
     out: List[Dict[str, Any]] = []
     errors: List[Dict[str, str]] = []
+    incremental = getattr(args, "incremental", False)
+    state = load_state() if incremental else {}
 
     for source in sources:
         try:
+            source_items: List[Dict[str, Any]] = []
             if source == "reddit":
-                out.extend(collect_reddit(args.query, args.limit, args.reddit_subreddit))
+                source_items = collect_reddit(args.query, args.limit, args.reddit_subreddit)
             elif source == "dc":
-                out.extend(collect_dc(args.query, args.limit, args.dc_gallery, args.dc_mode))
+                source_items = collect_dc(args.query, args.limit, args.dc_gallery, args.dc_mode)
             elif source == "github":
-                out.extend(collect_github(args.query, args.limit, args.github_repo))
+                source_items = collect_github(args.query, args.limit, args.github_repo)
             elif source == "hn":
-                out.extend(collect_hn(args.query, args.limit))
+                source_items = collect_hn(args.query, args.limit)
             elif source == "youtube":
-                out.extend(collect_youtube(args.query, args.limit))
+                source_items = collect_youtube(args.query, args.limit)
             elif source == "searxng":
-                out.extend(collect_searxng(args.query, args.limit, args.searxng_categories))
+                source_items = collect_searxng(args.query, args.limit, args.searxng_categories)
             elif source == "discord":
                 if not args.discord_channel:
                     raise AggregateError("discord source requires --discord-channel")
                 discord_items, discord_warnings = collect_discord(args.limit, args.discord_channel)
-                out.extend(discord_items)
+                source_items = discord_items
                 for warning in discord_warnings:
                     errors.append({"source": source, "error": warning})
+            if incremental:
+                source_items = filter_incremental(source_items, source, state)
+                update_state_for_source(state, source, source_items)
+            out.extend(source_items)
         except Exception as exc:
             errors.append({"source": source, "error": str(exc)})
+
+    if incremental:
+        save_state(state)
 
     for item in out:
         item.setdefault("extra", {})["bucket"] = _bucket_for_item(item)
@@ -655,6 +718,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bucket", choices=("news", "community", "dev", "other"), help="Filter final output to one bucket")
     parser.add_argument("--searxng-categories", default=None, help="SearXNG categories (comma-separated, e.g. general,news,it)")
     parser.add_argument("--discord-channel", action="append", help="Discord channel id to fetch. Repeatable.")
+    parser.add_argument("--incremental", action="store_true", help="Only collect items newer than last run (uses state.json)")
     return parser
 
 
