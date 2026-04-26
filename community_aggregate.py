@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 WORKSPACE = Path(__file__).resolve().parent.parent
 SCRIPTS = WORKSPACE / "scripts"
 STATE_FILE = Path(__file__).resolve().parent / "state.json"
+WATCHLIST_FILE = Path(__file__).resolve().parent / "watchlist.json"
 DEFAULT_SOURCES = ["reddit", "dc", "github", "hn", "youtube", "searxng"]
 ALL_SOURCES = DEFAULT_SOURCES + ["searxng", "discord"]
 DESCRIPTION = "Aggregate community sentiment/signals across non-Discord sources by default, with optional Discord support."
@@ -141,6 +142,42 @@ def filter_incremental(items: List[Dict[str, Any]], source: str, state: Dict[str
         elif not last_ts and url and url != last_id:
             filtered.append(item)
     return filtered
+
+
+def load_watchlist() -> Dict[str, Any]:
+    if WATCHLIST_FILE.exists():
+        try:
+            return json.loads(WATCHLIST_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {"keywords": [], "galleries": [], "subreddits": []}
+
+
+def matches_watchlist(item: Dict[str, Any], watchlist: Dict[str, Any]) -> List[str]:
+    matches = []
+    keywords = watchlist.get("keywords") or []
+    galleries = watchlist.get("galleries") or []
+    subreddits = watchlist.get("subreddits") or []
+    text = " ".join(filter(None, [
+        item.get("title") or "",
+        item.get("summary") or "",
+        (item.get("extra") or {}).get("gallery") or "",
+        (item.get("extra") or {}).get("gallery_name") or "",
+        (item.get("extra") or {}).get("subreddit") or "",
+    ])).lower()
+    for kw in keywords:
+        if kw.lower() in text:
+            matches.append(f"keyword:{kw}")
+    extra = item.get("extra") or {}
+    item_gallery = (extra.get("gallery") or extra.get("source_gallery_id") or "").lower()
+    for g in galleries:
+        if g.lower() == item_gallery:
+            matches.append(f"gallery:{g}")
+    item_sub = (extra.get("subreddit") or "").lower()
+    for s in subreddits:
+        if s.lower() == item_sub:
+            matches.append(f"subreddit:{s}")
+    return matches
 
 
 def to_item(source: str, kind: str, title: str, url: str, *, author: Optional[str] = None, published: Optional[str] = None,
@@ -569,6 +606,8 @@ def aggregate(args: argparse.Namespace) -> Dict[str, Any]:
     out: List[Dict[str, Any]] = []
     errors: List[Dict[str, str]] = []
     incremental = getattr(args, "incremental", False)
+    watch = getattr(args, "watch", False)
+    watch_alert = getattr(args, "watch_alert", False)
     state = load_state() if incremental else {}
 
     for source in sources:
@@ -606,6 +645,17 @@ def aggregate(args: argparse.Namespace) -> Dict[str, Any]:
     for item in out:
         item.setdefault("extra", {})["bucket"] = _bucket_for_item(item)
 
+    watch_matches: List[Dict[str, Any]] = []
+    if watch or watch_alert:
+        watchlist = load_watchlist()
+        for item in out:
+            matched = matches_watchlist(item, watchlist)
+            if matched:
+                item.setdefault("extra", {})["watch_matches"] = matched
+                watch_matches.append(item)
+        if watch:
+            out = watch_matches
+
     if args.bucket:
         out = [item for item in out if (item.get("extra") or {}).get("bucket") == args.bucket]
 
@@ -627,7 +677,7 @@ def aggregate(args: argparse.Namespace) -> Dict[str, Any]:
         for bucket, items in buckets.items()
     }
 
-    return {
+    result = {
         "query": args.query,
         "sources": sources,
         "count": len(out),
@@ -637,6 +687,9 @@ def aggregate(args: argparse.Namespace) -> Dict[str, Any]:
         "errors": errors,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
+    if watch_alert and watch_matches:
+        result["watch_alerts"] = watch_matches
+    return result
 
 
 def _append_item_text(lines: List[str], item: Dict[str, Any], *, include_summary: bool = True) -> None:
@@ -700,6 +753,34 @@ def emit_text(payload: Dict[str, Any], output_mode: str = "default") -> str:
     return "\n".join(lines).rstrip()
 
 
+SOURCE_EMOJI = {
+    "reddit": "\U0001f4e2",
+    "dc": "\U0001f1f0\U0001f1f7",
+    "github": "\U0001f4bb",
+    "hn": "\U0001f4d0",
+    "youtube": "\U0001f3ac",
+    "searxng": "\U0001f50d",
+    "discord": "\U0001f4ac",
+}
+
+
+def emit_watch_alert(payload: Dict[str, Any]) -> str:
+    alerts = payload.get("watch_alerts") or []
+    if not alerts:
+        return ""
+    lines = ["\u26a0\ufe0f Watchlist Alert"]
+    for item in alerts:
+        source = item.get("source") or ""
+        emoji = SOURCE_EMOJI.get(source, "\U0001f4cc")
+        title = item.get("title") or "(no title)"
+        url = item.get("url") or ""
+        wm = (item.get("extra") or {}).get("watch_matches") or []
+        lines.append(f"{emoji} [{', '.join(wm)}] {title}")
+        if url:
+            lines.append(f"   {url}")
+    return "\n".join(lines)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=DESCRIPTION)
     parser.add_argument("query", nargs="?", default="hot", help="Query to search across collectors (defaults to hot/general news)")
@@ -719,6 +800,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--searxng-categories", default=None, help="SearXNG categories (comma-separated, e.g. general,news,it)")
     parser.add_argument("--discord-channel", action="append", help="Discord channel id to fetch. Repeatable.")
     parser.add_argument("--incremental", action="store_true", help="Only collect items newer than last run (uses state.json)")
+    parser.add_argument("--watch", action="store_true", help="Filter results to watchlist matches only (uses watchlist.json)")
+    parser.add_argument("--watch-alert", action="store_true", help="Output watchlist matches in alert format for Telegram delivery")
     return parser
 
 
@@ -750,6 +833,12 @@ def main() -> int:
     except AggregateError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
+
+    if args.watch_alert and payload.get("watch_alerts"):
+        alert_text = emit_watch_alert(payload)
+        if alert_text:
+            print(alert_text)
+            print()
 
     if args.format == "json":
         print(json.dumps(payload, ensure_ascii=False, indent=2))
