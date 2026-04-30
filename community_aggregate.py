@@ -39,6 +39,31 @@ SOURCE_BASE_WEIGHTS = {
     "discord": 700,
 }
 
+# Signal-quality heuristics. These are intentionally simple and transparent:
+# the radar should favor items that look actionable/structural, and demote
+# pure meme/gossip traffic that can dominate raw community hot lists.
+HIGH_SIGNAL_TERMS = {
+    "ai", "agent", "llm", "model", "openai", "anthropic", "google", "mistral", "claude",
+    "gemini", "gpt", "gpu", "nvidia", "amd", "semiconductor", "chip", "benchmark",
+    "release", "launched", "launch", "open source", "opensource", "api", "sdk", "pricing",
+    "outage", "incident", "downtime", "breach", "leak", "vulnerability", "cve", "exploit",
+    "security", "supply chain", "lawsuit", "regulation", "policy", "ban", "tariff", "oil",
+    "iran", "ukraine", "russia", "china", "taiwan", "korea", "rate", "inflation",
+    "earnings", "acquisition", "investment", "funding", "ipo", "merger",
+    "인공지능", "에이아이", "모델", "오픈AI", "앤트로픽", "구글", "반도체", "엔비디아", "AMD",
+    "보안", "취약점", "해킹", "유출", "장애", "사고", "출시", "공개", "규제", "정책",
+    "금리", "물가", "환율", "유가", "투자", "인수", "합병", "소송", "중국", "대만", "이란", "우크라이나",
+}
+
+LOW_SIGNAL_TERMS = {
+    "싱글벙글", "와들와들", "ㅋㅋ", "ㅎㅎ", "개웃", "웃긴", "짤", "밈", "진상", "설거지론",
+    "념글", "개념글", "후방", "인증", "떡밥", "어그로", "gossip", "meme", "funny",
+}
+
+HIGH_SIGNAL_SUBREDDITS = {"singularity", "technology", "programming", "worldnews", "machinelearning", "localllama"}
+LOW_SIGNAL_DC_HINTS = {"싱갤", "주갤", "해갤"}
+QUALITY_MODE_DEFAULT_MIN = {"raw": None, "balanced": None, "signal": 35}
+
 SEARXNG_BASE_URL = "https://vps4.tail1546e7.ts.net:18443"
 DEFAULT_HOT_SUBREDDITS = ["technology", "worldnews", "programming", "singularity"]
 DEFAULT_BUCKET_PREVIEW = 3
@@ -48,10 +73,18 @@ PRESET_CONFIGS = {
         "sources": ["reddit", "dc", "hn", "youtube"],
         "bucket": None,
     },
+    "signal-news": {
+        "query": "hot",
+        "sources": ["reddit", "dc", "github", "hn", "youtube"],
+        "bucket": None,
+        "quality_mode": "signal",
+        "max_items": 12,
+    },
     "agent-news": {
         "query": "OpenClaw",
         "sources": ["reddit", "dc", "github", "hn", "youtube"],
         "bucket": None,
+        "quality_mode": "signal",
     },
 }
 
@@ -264,6 +297,116 @@ def _compute_percentiles(items: List[Dict[str, Any]]) -> None:
             item.setdefault("extra", {})["percentile"] = round(percentile, 1)
 
 
+def _contains_any(text: str, terms: set[str]) -> List[str]:
+    lowered = text.lower()
+    found = []
+    for term in terms:
+        needle = term.lower()
+        # For Latin tokens, require token boundaries so "ai" does not match "aid".
+        if re.fullmatch(r"[a-z0-9][a-z0-9 +._/-]*", needle):
+            pattern = r"(?<![a-z0-9])" + re.escape(needle) + r"(?![a-z0-9])"
+            matched = re.search(pattern, lowered) is not None
+        else:
+            matched = needle in lowered
+        if matched:
+            found.append(term)
+    return sorted(found, key=len, reverse=True)
+
+
+def _signal_profile_for_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Return transparent signal-quality metadata for ranking and summaries."""
+    extra = item.get("extra") or {}
+    text = " ".join(filter(None, [
+        item.get("title") or "",
+        item.get("summary") or "",
+        str(extra.get("source_gallery_name") or ""),
+        str(extra.get("source_gallery_hint") or ""),
+        str(extra.get("subreddit") or ""),
+        " ".join(extra.get("topics") or []) if isinstance(extra.get("topics"), list) else "",
+    ]))
+
+    matched_high = _contains_any(text, HIGH_SIGNAL_TERMS)
+    matched_low = _contains_any(text, LOW_SIGNAL_TERMS)
+    score = 0
+    reasons: List[str] = []
+    penalties: List[str] = []
+
+    if matched_high:
+        score += min(45, 12 + len(matched_high[:4]) * 8)
+        reasons.append("topic:" + ",".join(matched_high[:3]))
+
+    source = item.get("source") or ""
+    kind = item.get("kind") or ""
+    if source in {"hn", "github", "searxng"}:
+        score += 18
+        reasons.append(f"source:{source}")
+    elif source == "reddit":
+        subreddit = (extra.get("subreddit") or "").lower()
+        if subreddit in HIGH_SIGNAL_SUBREDDITS:
+            score += 14
+            reasons.append(f"subreddit:{subreddit}")
+    elif source == "youtube":
+        # YouTube search is useful, but can be clickbait-heavy; require topic or views to shine.
+        score += 4
+    elif source == "dc":
+        gallery_hint = str(extra.get("source_gallery_hint") or extra.get("gallery") or "")
+        if gallery_hint in LOW_SIGNAL_DC_HINTS:
+            score -= 12
+            penalties.append(f"dc_low_signal_gallery:{gallery_hint}")
+
+    comments = item.get("comments") or 0
+    popularity = (item.get("score") or 0) + comments * 2
+    if popularity >= 500:
+        score += 12
+        reasons.append("strong_reaction")
+    elif popularity >= 100:
+        score += 7
+        reasons.append("reaction")
+
+    if kind in {"issue", "pr"}:
+        score += 10
+        reasons.append("dev_thread")
+    elif kind == "repo":
+        score += 6
+        reasons.append("repo")
+
+    if extra.get("watch_matches"):
+        score += 30
+        reasons.append("watchlist")
+
+    if matched_low:
+        penalty = min(35, 12 + len(matched_low[:3]) * 8)
+        score -= penalty
+        penalties.append("low_signal:" + ",".join(matched_low[:3]))
+
+    # Recency matters for a radar, but avoid over-penalizing sources that only expose relative dates.
+    decay = _time_decay_factor(item.get("published"))
+    if decay < 0.5:
+        score -= 8
+        penalties.append("stale")
+
+    score = max(0, min(100, score))
+    label = "high" if score >= 60 else "medium" if score >= 35 else "low"
+    return {
+        "quality_score": score,
+        "quality_label": label,
+        "why": reasons[:4],
+        "penalties": penalties[:3],
+    }
+
+
+def annotate_signal_quality(items: List[Dict[str, Any]]) -> None:
+    for item in items:
+        item.setdefault("extra", {}).update(_signal_profile_for_item(item))
+
+
+def _quality_threshold(args: argparse.Namespace) -> Optional[int]:
+    explicit = getattr(args, "min_quality", None)
+    if explicit is not None:
+        return explicit
+    return QUALITY_MODE_DEFAULT_MIN.get(getattr(args, "quality_mode", "balanced"))
+
+
 def _time_decay_factor(published: Optional[str]) -> float:
     if not published:
         return 1.0
@@ -321,6 +464,17 @@ def _universal_rank(item: Dict[str, Any], query: Optional[str] = None) -> int:
             rank -= 160
         if source == "youtube":
             rank -= 60
+
+    quality_score = as_int(extra.get("quality_score"))
+    if quality_score is not None:
+        # Pull meaningful structural signals upward and push meme/gossip traffic down.
+        rank += int((quality_score - 35) * 12)
+        if quality_score < 20:
+            rank -= 300
+        if extra.get("penalties"):
+            rank -= 120 * len(extra.get("penalties") or [])
+        if extra.get("watch_matches"):
+            rank += 500
     return rank
 
 
@@ -716,6 +870,15 @@ def aggregate(args: argparse.Namespace) -> Dict[str, Any]:
         if watch:
             out = watch_matches
 
+    annotate_signal_quality(out)
+
+    min_quality = _quality_threshold(args)
+    if min_quality is not None:
+        out = [
+            item for item in out
+            if (as_int((item.get("extra") or {}).get("quality_score")) or 0) >= min_quality
+        ]
+
     if args.bucket:
         out = [item for item in out if (item.get("extra") or {}).get("bucket") == args.bucket]
 
@@ -744,6 +907,8 @@ def aggregate(args: argparse.Namespace) -> Dict[str, Any]:
         "items": out,
         "buckets": buckets,
         "bucket_summaries": bucket_summaries,
+        "quality_mode": getattr(args, "quality_mode", "balanced"),
+        "min_quality": min_quality,
         "errors": errors,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -762,12 +927,20 @@ def _append_item_text(lines: List[str], item: Dict[str, Any], *, include_summary
         meta.append(f"score: {item['score']}")
     if item.get("comments") is not None:
         meta.append(f"comments: {item['comments']}")
+    extra = item.get("extra") or {}
+    if extra.get("quality_score") is not None:
+        why = ",".join(extra.get("why") or [])
+        label = extra.get("quality_label") or "?"
+        quality = f"signal: {extra['quality_score']}/{label}"
+        if why:
+            quality += f" ({why})"
+        meta.append(quality)
     if item.get('source') == 'dc':
-        dc_gallery = (item.get('extra') or {}).get('source_gallery_name') or (item.get('extra') or {}).get('gallery_name') or (item.get('extra') or {}).get('gallery')
+        dc_gallery = extra.get('source_gallery_name') or extra.get('gallery_name') or extra.get('gallery')
         if dc_gallery:
             meta.append(f"gallery: {dc_gallery}")
     elif item.get('source') == 'reddit':
-        subreddit = (item.get('extra') or {}).get('subreddit')
+        subreddit = extra.get('subreddit')
         if subreddit:
             meta.append(f"subreddit: {subreddit}")
     lines.append(f"- [{item.get('source')}/{item.get('kind')}] {item.get('title')}")
@@ -780,7 +953,10 @@ def _append_item_text(lines: List[str], item: Dict[str, Any], *, include_summary
 
 
 def emit_text(payload: Dict[str, Any], output_mode: str = "default") -> str:
-    lines = [f"community aggregate query={payload.get('query')!r} count={payload.get('count')} sources={','.join(payload.get('sources') or [])}"]
+    quality = payload.get("quality_mode") or "balanced"
+    min_quality = payload.get("min_quality")
+    quality_suffix = f" quality={quality}" + (f" min={min_quality}" if min_quality is not None else "")
+    lines = [f"community aggregate query={payload.get('query')!r} count={payload.get('count')} sources={','.join(payload.get('sources') or [])}{quality_suffix}"]
     if payload.get("errors"):
         lines.append("")
         lines.append("[warnings]")
@@ -841,6 +1017,9 @@ def emit_telegram(payload: Dict[str, Any]) -> str:
             meta_parts.append(f"\u2b06{score}")
         if comments is not None:
             meta_parts.append(f"\U0001f4ac{comments}")
+        q = (item.get("extra") or {}).get("quality_score")
+        if q is not None:
+            meta_parts.append(f"\U0001f4a1{q}")
         meta = " ".join(meta_parts)
         line = f"{emoji} {title}"
         if meta:
@@ -883,6 +1062,9 @@ def emit_markdown(payload: Dict[str, Any]) -> str:
                     meta_parts.append(f"\u2b06{score}")
                 if comments is not None:
                     meta_parts.append(f"\U0001f4ac{comments}")
+                q = (item.get("extra") or {}).get("quality_score")
+                if q is not None:
+                    meta_parts.append(f"\U0001f4a1{q}")
                 meta = " ".join(meta_parts)
                 if url:
                     lines.append(f"- {emoji} [{title}]({url}) {meta}")
@@ -941,6 +1123,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dc-mode", choices=("auto", "search", "best", "popular"), default="auto", help="DC collection mode")
     parser.add_argument("--github-repo", help="Optional owner/repo to search repo issues/PRs instead of global GitHub search")
     parser.add_argument("--bucket", choices=("news", "community", "dev", "other"), help="Filter final output to one bucket")
+    parser.add_argument("--quality-mode", choices=("raw", "balanced", "signal"), default="balanced", help="Signal-quality mode: raw disables filtering, signal filters low-value meme/gossip traffic")
+    parser.add_argument("--min-quality", type=int, default=None, help="Minimum signal score 0-100; defaults to 35 in --quality-mode signal")
     parser.add_argument("--searxng-categories", default=None, help="SearXNG categories (comma-separated, e.g. general,news,it)")
     parser.add_argument("--discord-channel", action="append", help="Discord channel id to fetch. Repeatable.")
     parser.add_argument("--incremental", action="store_true", help="Only collect items newer than last run (uses state.json)")
@@ -1052,6 +1236,10 @@ def main() -> int:
             args.sources = list(preset["sources"])
         if args.bucket is None and preset.get("bucket") is not None:
             args.bucket = preset["bucket"]
+        if preset.get("quality_mode") and args.quality_mode == parser.get_default("quality_mode"):
+            args.quality_mode = preset["quality_mode"]
+        if preset.get("max_items") and args.max_items == parser.get_default("max_items"):
+            args.max_items = preset["max_items"]
 
     if args.sources is None:
         args.sources = list(DEFAULT_SOURCES)
