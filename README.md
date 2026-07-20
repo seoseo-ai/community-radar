@@ -37,8 +37,24 @@ python3 github_fetch.py search-issues "label:bug" --limit 5
 
 ```bash
 python3 community_aggregate.py --preset general-news   # 일반 뉴스
+python3 community_aggregate.py --preset signal-news    # 저품질 밈/잡담 억제 + 의미 신호 우선
 python3 community_aggregate.py --preset agent-news      # 에이전트/AI 관련
 ```
+
+### 신호 품질 모드
+
+```bash
+# 기본: raw 인기도 + 품질 점수를 함께 반영
+python3 community_aggregate.py hot --quality-mode balanced
+
+# 의미 있는 뉴스/개발/정책/보안/AI 신호만 더 강하게 선별
+python3 community_aggregate.py --preset signal-news
+
+# 직접 임계값 지정: signal score 50점 이상만
+python3 community_aggregate.py hot --quality-mode signal --min-quality 50
+```
+
+각 항목에는 `signal: 점수/등급 (이유)`가 붙습니다. 예: `topic:openai,model`, `source:hn`, `strong_reaction`.
 
 ## 의존성
 
