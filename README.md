@@ -65,3 +65,7 @@ python3 community_aggregate.py hot --quality-mode signal --min-quality 50
 ## 라이선스
 
 MIT
+
+## Offline CI
+
+Pull requests and main-branch pushes compile tracked Python and check Bash syntax without importing or executing operational entry points. No deployment or service restart is performed by this workflow.
