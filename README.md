@@ -1,5 +1,10 @@
 # Community Radar (커뮤니티 레이더)
 
+> **상태: 레거시 — 보관(archive)됨 (2026-11-26).** 이 저장소는 더 갱신하지 않습니다.
+> 정본은 [`jinwon-int/community-scanner`](https://github.com/jinwon-int/community-scanner)입니다. 2026-11-26에 보안 리뷰 수정(jinwon-int/community-scanner#10: `gh api` GET 고정, TLS 검증, 응답 크기 상한 등)이 그쪽에만 반영됐습니다. 이 저장소의 코드는 그 수정 **이전** 버전이므로 실행하지 마세요.
+>
+> **Status: legacy — archived (2026-11-26).** Use [`jinwon-int/community-scanner`](https://github.com/jinwon-int/community-scanner) instead; this copy predates its security fixes and should not be run.
+
 실시간 커뮤니티 신호 수집기. Reddit, DC Inside, Hacker News, GitHub, YouTube, Discord에서 핫 토픽/이슈를 통합 수집합니다.
 
 ## 소스별 수집기
